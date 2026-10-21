@@ -1,0 +1,169 @@
+// src/sim/contest.ts
+// TASK 10 — resolve bulldozer push/burnout and contest drain.
+
+import {
+  BULLDOZER_BURN,
+  BULLDOZER_BURN_PER_TICK,
+  CONTEST_DRAIN_PER_TICK,
+  EDGE_DRAIN_PER_TICK,
+  STRENGTH_SCALE,
+  TILE_MAX,
+  TILE_MIN,
+} from './types';
+import type { MatchState, Unit } from './types';
+import { aliveUnits, byId, facingEnemy, unitsOnCell } from './state';
+import { behindTile, forward, opponentGoalTile } from './geometry';
+import { dropBall, killUnit, syncCarried, tryPickup } from './ball';
+
+function pairKey(a: Unit, b: Unit): string {
+  return a.lane + ':' + Math.min(a.tile, b.tile) + ':' + Math.min(a.id, b.id) + ':' + Math.max(a.id, b.id);
+}
+
+function bulldozerPair(a: Unit, b: Unit): boolean {
+  return a.kind === 'bulldozer' || b.kind === 'bulldozer';
+}
+
+export function applyBulldozer(state: MatchState, bull: Unit, opp: Unit): 'pushed' | 'burnout' {
+  if (opp.strength < bull.strength) {
+    const n = Math.floor((bull.strength - opp.strength) / 100);
+    const dir = -forward(opp.owner);
+    let dest = opp.tile;
+    for (let i = 0; i < n; i += 1) {
+      const nt = dest + dir;
+      if (nt < TILE_MIN || nt > TILE_MAX) break;
+      const blockers = unitsOnCell(state, opp.lane, nt).filter(u => u.id !== opp.id);
+      if (blockers.length > 0) break;
+      dest = nt;
+    }
+    if (dest !== opp.tile) {
+      opp.tile = dest;
+      opp.inContest = false;
+      bull.inContest = false;
+      if (opp.holdingBall) syncCarried(state);
+      tryPickup(state, opp);
+      return 'pushed';
+    }
+  }
+  killUnit(state, bull);
+  if (opp.alive) opp.burnLeft += BULLDOZER_BURN;
+  opp.inContest = false;
+  return 'burnout';
+}
+
+export function applyBurns(state: MatchState): void {
+  for (const u of byId(aliveUnits(state))) {
+    if (!u.alive || u.burnLeft <= 0) continue;
+    const d = Math.min(BULLDOZER_BURN_PER_TICK, u.burnLeft);
+    u.strength -= d;
+    u.burnLeft -= d;
+    if (u.strength <= 0) killUnit(state, u);
+  }
+}
+
+export function beginContest(state: MatchState, a: Unit, b: Unit): void {
+  if (!a.alive || !b.alive) return;
+  if (bulldozerPair(a, b)) return;
+  if (a.inContest && b.inContest) return;
+
+  let holder: Unit | null = null;
+  if (a.holdingBall) holder = a;
+  else if (b.holdingBall) holder = b;
+
+  if (holder !== null && holder.kind === 'blitz' && holder.tilesSinceDeploy > 2) {
+    dropBall(state, holder.lane, behindTile(holder.owner, holder.tile));
+    holder = null;
+  }
+
+  let snatched = false;
+  if (a.kind === 'tripwire' && b.holdingBall && b.strength > a.strength) {
+    dropBall(state, a.lane, behindTile(a.owner, a.tile));
+    snatched = true;
+  } else if (b.kind === 'tripwire' && a.holdingBall && a.strength > b.strength) {
+    dropBall(state, b.lane, behindTile(b.owner, b.tile));
+    snatched = true;
+  }
+
+  if (snatched === false) {
+    if (a.kind === 'tripwire' && b.alive && !b.holdingBall) {
+      b.strength -= STRENGTH_SCALE;
+      if (b.strength <= 0) killUnit(state, b);
+    }
+    if (b.kind === 'tripwire' && a.alive && !a.holdingBall) {
+      a.strength -= STRENGTH_SCALE;
+      if (a.strength <= 0) killUnit(state, a);
+    }
+  }
+
+  if (!a.alive || !b.alive) return;
+
+  const still = facingEnemy(state, a);
+  if (still === null || still.id !== b.id) return;
+
+  a.inContest = true;
+  b.inContest = true;
+  a.momentumSinceContest = 0;
+  b.momentumSinceContest = 0;
+}
+
+export function refreshContest(state: MatchState): void {
+  const seen = new Set<string>();
+  for (const u of byId(aliveUnits(state))) {
+    if (!u.alive) continue;
+    const e = facingEnemy(state, u);
+    if (e === null || !e.alive) continue;
+    if (bulldozerPair(u, e)) continue;
+    const key = pairKey(u, e);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    beginContest(state, u, e);
+  }
+  for (const u of aliveUnits(state)) {
+    const e = facingEnemy(state, u);
+    if (e === null || !e.alive || bulldozerPair(u, e)) u.inContest = false;
+    else u.inContest = true;
+  }
+}
+
+function resolvePair(state: MatchState, a: Unit, b: Unit): void {
+  const aDead = !a.alive || a.strength <= 0;
+  const bDead = !b.alive || b.strength <= 0;
+  if (!aDead && !bDead) return;
+  if (aDead && bDead) {
+    if (a.holdingBall) {
+      killUnit(state, b);
+      killUnit(state, a);
+    } else {
+      killUnit(state, a);
+      killUnit(state, b);
+    }
+    return;
+  }
+  const winner = aDead ? b : a;
+  const loser = aDead ? a : b;
+  killUnit(state, loser);
+  winner.inContest = false;
+}
+
+export function drainContests(state: MatchState): void {
+  const seen = new Set<string>();
+  for (const u of byId(aliveUnits(state))) {
+    if (!u.alive || !u.inContest) continue;
+    const opp = facingEnemy(state, u);
+    if (opp === null || !opp.alive) continue;
+    const key = pairKey(u, opp);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    u.strength -= CONTEST_DRAIN_PER_TICK;
+    opp.strength -= CONTEST_DRAIN_PER_TICK;
+    resolvePair(state, u, opp);
+  }
+}
+
+export function drainEdges(state: MatchState): void {
+  for (const u of byId(aliveUnits(state))) {
+    if (!u.alive || u.holdingBall || u.strength <= 0) continue;
+    if (u.tile !== opponentGoalTile(u.owner)) continue;
+    u.strength -= EDGE_DRAIN_PER_TICK;
+    if (u.strength <= 0) killUnit(state, u);
+  }
+}
